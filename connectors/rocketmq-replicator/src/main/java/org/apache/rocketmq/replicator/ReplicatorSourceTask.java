@@ -87,9 +87,21 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.BiConsumer;
+import java.util.function.Consumer;
+
+import static org.apache.rocketmq.connect.runtime.connectorwrapper.WorkerSinkTask.QUEUE_OFFSET;
+import static org.apache.rocketmq.connect.runtime.connectorwrapper.WorkerSinkTask.TOPIC;
+
 /**
  * @author osgoo
- * @date 2022/6/16
  */
 public class ReplicatorSourceTask extends SourceTask {
     private static final Logger log = LoggerFactory.getLogger(ReplicatorSourceTask.class);
@@ -103,6 +115,12 @@ public class ReplicatorSourceTask extends SourceTask {
         @Override
         public Thread newThread(Runnable r) {
             return new Thread(r, "Replicator_lag_metrics");
+        }
+    });
+    private ScheduledExecutorService commitOffsetScheduleService = Executors.newSingleThreadScheduledExecutor(new ThreadFactory() {
+        @Override
+        public Thread newThread(Runnable r) {
+            return new Thread(r, "Commit_offset_schedule");
         }
     });
     private Map<String, List<String>> metricsItem2KeyMap = new HashMap<>();
@@ -131,16 +149,16 @@ public class ReplicatorSourceTask extends SourceTask {
     private AtomicInteger pollCounter = new AtomicInteger();
     private AtomicInteger rateCounter = new AtomicInteger();
 
-    private final String REPLICATOR_SRC_TOPIC_PROPERTY_KEY = "REPLICATOR-source-topic";
+    private static final String REPLICATOR_SRC_TOPIC_PROPERTY_KEY = "REPLICATOR-source-topic";
     // msg born timestamp on src
-    private final String REPLICATOR_BORN_SOURCE_TIMESTAMP = "REPLICATOR-BORN-SOURCE-TIMESTAMP";
+    private static final String REPLICATOR_BORN_SOURCE_TIMESTAMP = "REPLICATOR-BORN-SOURCE-TIMESTAMP";
     // msg born from where
-    private final String REPLICATOR_BORN_SOURCE_CLOUD_CLUSTER_REGION = "REPLICATOR-BORN-SOURCE";
+    private static final String REPLICATOR_BORN_SOURCE_CLOUD_CLUSTER_REGION = "REPLICATOR-BORN-SOURCE";
     // msg born from which topic
-    private final String REPLICATOR_BORE_INSTANCEID_TOPIC = "REPLICATOR-BORN-TOPIC";
-    // src messageid  equals MessageConst.PROPERTY_EXTEND_UNIQ_INFO
+    private static final String REPLICATOR_BORE_INSTANCEID_TOPIC = "REPLICATOR-BORN-TOPIC";
+    // src message id  equals MessageConst.PROPERTY_EXTEND_UNIQ_INFO
     private static final String REPLICATOR_SRC_MESSAGE_ID = "EXTEND_UNIQ_INFO";
-    // src dupinof  equals MessageConst.DUP_INFO
+    // src dup info  equals MessageConst.DUP_INFO
     private static final String REPLICATOR_DUP_INFO = "DUP_INFO";
 
     // following sys reserved properties
@@ -206,7 +224,6 @@ public class ReplicatorSourceTask extends SourceTask {
         if (srcMQAdminExt != null) {
             srcMQAdminExt.shutdown();
         }
-        // use /home/admin/onskey white ak as default
         RPCHook rpcHook = null;
         if (connectorConfig.isSrcAclEnable()) {
             if (StringUtils.isNotEmpty(connectorConfig.getSrcAccessKey()) && StringUtils.isNotEmpty(connectorConfig.getSrcSecretKey())) {
@@ -219,14 +236,15 @@ public class ReplicatorSourceTask extends SourceTask {
         }
         srcMQAdminExt = new DefaultMQAdminExt(rpcHook);
         srcMQAdminExt.setNamesrvAddr(connectorConfig.getSrcEndpoint());
-        srcMQAdminExt.setAdminExtGroup(ReplicatorConnectorConfig.ADMIN_GROUP + "-" + UUID.randomUUID().toString());
-        srcMQAdminExt.setInstanceName(connectorConfig.generateSourceString() + "-" + UUID.randomUUID().toString());
+        srcMQAdminExt.setAdminExtGroup(ReplicatorConnectorConfig.ADMIN_GROUP + "-" + UUID.randomUUID());
+        srcMQAdminExt.setInstanceName(connectorConfig.generateSourceString() + "-" + UUID.randomUUID());
 
         log.info("initAdminThread : " + Thread.currentThread().getName());
         srcMQAdminExt.start();
     }
 
-    private void createAndUpdatePullConsumerGroup(String clusterName, String subscriptionGroupName) throws InterruptedException, MQBrokerException, RemotingTimeoutException, RemotingSendRequestException, RemotingConnectException {
+    private void createAndUpdatePullConsumerGroup(String clusterName,
+        String subscriptionGroupName) throws InterruptedException, MQBrokerException, RemotingTimeoutException, RemotingSendRequestException, RemotingConnectException {
         SubscriptionGroupConfig subscriptionGroupConfig = new SubscriptionGroupConfig();
         subscriptionGroupConfig.setGroupName(subscriptionGroupName);
         ClusterInfo clusterInfo = srcMQAdminExt.examineBrokerClusterInfo();
@@ -236,8 +254,8 @@ public class ReplicatorSourceTask extends SourceTask {
             brokerNames = clusterInfo.getClusterAddrTable().get(clusterName);
         }
         Set<String> masterSet = new HashSet<>();
-        for(BrokerData brokerData: brokerDatas){
-            for (Map.Entry<Long, String> entry : brokerData.getBrokerAddrs().entrySet()){
+        for (BrokerData brokerData : brokerDatas) {
+            for (Map.Entry<Long, String> entry : brokerData.getBrokerAddrs().entrySet()) {
                 if (null != brokerNames && brokerNames.contains(brokerData.getBrokerName()) && entry.getKey().equals(0L)) {
                     masterSet.add(entry.getValue());
                 }
@@ -248,8 +266,8 @@ public class ReplicatorSourceTask extends SourceTask {
                 srcMQAdminExt.createAndUpdateSubscriptionGroupConfig(addr, subscriptionGroupConfig);
                 log.info("create subscription group to {} success.", addr);
             } catch (Exception e) {
-                log.error(" create subscription error,", e);
-                Thread.sleep(1000 * 1);
+                log.error("create subscription error,", e);
+                Thread.sleep(1000);
             }
         }
     }
@@ -260,7 +278,6 @@ public class ReplicatorSourceTask extends SourceTask {
         }
         String consumerGroup = connectorConfig.generateTaskIdWithIndexAsConsumerGroup();
         log.info("prepare to use " + consumerGroup + " as consumerGroup start consumer.");
-        // use /home/admin/onskey white ak as default
         RPCHook rpcHook = null;
         if (connectorConfig.isSrcAclEnable()) {
             if (StringUtils.isNotEmpty(connectorConfig.getSrcAccessKey()) && StringUtils.isNotEmpty(connectorConfig.getSrcSecretKey())) {
@@ -282,9 +299,8 @@ public class ReplicatorSourceTask extends SourceTask {
         ConsumeFromWhere consumeFromWhere = connectorConfig.getConsumeFromWhere();
         pullConsumer.setConsumeFromWhere(org.apache.rocketmq.common.consumer.ConsumeFromWhere.valueOf(consumeFromWhere.name()));
         log.info("litePullConsumer use " + consumeFromWhere.name());
-        long consumeFromTimestamp = System.currentTimeMillis();
         if (consumeFromWhere == ConsumeFromWhere.CONSUME_FROM_TIMESTAMP) {
-            consumeFromTimestamp = connectorConfig.getConsumeFromTimestamp();
+            long consumeFromTimestamp = connectorConfig.getConsumeFromTimestamp();
             String timestamp = UtilAll.timeMillisToHumanString3(consumeFromTimestamp);
             pullConsumer.setConsumeTimestamp(timestamp);
             log.info("litePullConsumer consume start at " + timestamp);
@@ -302,8 +318,8 @@ public class ReplicatorSourceTask extends SourceTask {
 
         for (MessageQueue mq : allQueues) {
             String topic = mq.getTopic();
-            String tag = connectorConfig.getSrcTopicTagMap(connectorConfig.getSrcInstanceId(), connectorConfig.getSrcTopicTags()).get(topic);
-//            pullConsumer.setSubExpressionForAssign(topic, tag);
+            String tag = ReplicatorConnectorConfig.getSrcTopicTagMap(connectorConfig.getSrcInstanceId(), connectorConfig.getSrcTopicTags()).get(topic);
+            pullConsumer.setSubExpressionForAssign(topic, tag);
         }
 
         try {
@@ -319,7 +335,7 @@ public class ReplicatorSourceTask extends SourceTask {
         log.info("prepare to parse queueStr 2 obj : " + queueStrs);
         List<MessageQueue> allQueues = new ArrayList<>();
         List<MessageQueue> array = JSON.parseArray(queueStrs, MessageQueue.class);
-        for (int i = 0;i < array.size();i++) {
+        for (int i = 0; i < array.size(); i++) {
             MessageQueue mq = array.get(i);
             allQueues.add(mq);
         }
@@ -330,32 +346,29 @@ public class ReplicatorSourceTask extends SourceTask {
         metricsMonitorExecutorService.scheduleAtFixedRate(new Runnable() {
             @Override
             public void run() {
-                replicateLagMetric();
-                commitOffsetSchedule();
+                try {
+                    replicateLagMetric();
+                } catch (Throwable e) {
+                    log.error("replicate log metric error", e);
+                }
             }
         }, period, period, TimeUnit.MILLISECONDS);
+
+        commitOffsetScheduleService.scheduleAtFixedRate(new Runnable() {
+            @Override public void run() {
+                try {
+                    commitOffsetSchedule();
+                } catch (Throwable e) {
+                    log.error("commit offset error", e);
+                }
+            }
+        }, connectorConfig.getCommitOffsetIntervalMs(), connectorConfig.getCommitOffsetIntervalMs(), TimeUnit.MILLISECONDS);
     }
 
     private void commitOffsetSchedule() {
-        ConcurrentHashMap<MessageQueue, AtomicLong> bakPrepareCommitOffset = prepareCommitOffset;
-        prepareCommitOffset = new ConcurrentHashMap<>();
-        if (MapUtils.isNotEmpty(bakPrepareCommitOffset)) {
-            bakPrepareCommitOffset.forEach(new BiConsumer<MessageQueue, AtomicLong>() {
-                @Override
-                public void accept(MessageQueue mq, AtomicLong atomicLong) {
-                    long canCommitOffset = atomicLong.get();
-                    log.info("markQueueCommitted commit mq : " + mq + " offset : " + canCommitOffset);
-                    try {
-                        // commit offset directly to broker
-                        pullConsumer.getOffsetStore().updateOffset(mq, canCommitOffset, true);
-                        pullConsumer.getOffsetStore().updateConsumeOffsetToBroker(mq, canCommitOffset, true);
-                        log.info("update consumer offset mq : " + mq + " , offset : " + canCommitOffset);
-                    } catch (Exception e) {
-                        log.warn("update consume offset error, mq[" + mq + "], commitOffset[" + canCommitOffset + "]");
-                    }
-                }
-            });
-        }
+        Map<MessageQueue, Long> commitOffsetTable = new HashMap<>();
+        prepareCommitOffset.forEach((messageQueue, offset) -> commitOffsetTable.put(messageQueue, offset.get()));
+        pullConsumer.commitSync(commitOffsetTable, true);
     }
 
     private void replicateLagMetric() {
@@ -382,22 +395,22 @@ public class ReplicatorSourceTask extends SourceTask {
             List<String> delayMsKeys = new ArrayList<>();
             String normalNumKey = connectorConfig.getConnectorId();
             delayNumsKeys.add(normalNumKey);
-            ReplicatorTaskStats.incItemValue(ReplicatorTaskStats.REPLICATOR_SOURCE_TASK_DELAY_NUMS, normalNumKey, (int)normalDelayCount.get(), 1);
+            ReplicatorTaskStats.incItemValue(ReplicatorTaskStats.REPLICATOR_SOURCE_TASK_DELAY_NUMS, normalNumKey, (int) normalDelayCount.get(), 1);
             String normalMsKey = connectorConfig.getConnectorId();
             delayMsKeys.add(normalMsKey);
-            ReplicatorTaskStats.incItemValue(ReplicatorTaskStats.REPLICATOR_SOURCE_TASK_DELAY_MS, normalMsKey, (int)normalDelayMs.get(), 1);
+            ReplicatorTaskStats.incItemValue(ReplicatorTaskStats.REPLICATOR_SOURCE_TASK_DELAY_MS, normalMsKey, (int) normalDelayMs.get(), 1);
 
             metricsItem2KeyMap.put(ReplicatorTaskStats.REPLICATOR_SOURCE_TASK_DELAY_NUMS, delayNumsKeys);
             metricsItem2KeyMap.put(ReplicatorTaskStats.REPLICATOR_SOURCE_TASK_DELAY_MS, delayMsKeys);
         } catch (RemotingException | MQClientException e) {
-            log.error(" occur remoting or mqclient exception, retry build mqadminclient,", e);
+            log.error("occur remoting or mqclient exception, retry build mqadminclient", e);
             try {
                 buildMqAdminClient();
             } catch (MQClientException mqClientException) {
-                log.error(" rebuild mqadminclient error,", e);
+                log.error("rebuild mqadmin client error", e);
             }
         } catch (Exception e) {
-            log.error(" occur unknow exception,", e);
+            log.error(" occur unknown exception", e);
         }
     }
 
@@ -503,13 +516,20 @@ public class ReplicatorSourceTask extends SourceTask {
         }
         return null;
     }
+
     private String swapTopic(String topic) {
-        // normal topic, dest topic use destTopic config
-        if (!topic.startsWith("%RETRY%") && !topic.startsWith("%DLQ%")) {
-            return ReplicatorUtils.buildTopicWithNamespace(connectorConfig.getDestTopic(), connectorConfig.getDestInstanceId());
+        if (topic.startsWith("%RETRY%") || topic.startsWith("%DLQ%")) {
+            log.error("topic : " + topic + " is retry or dlq.");
+            return null;
         }
-        log.error("topic : " + topic + " is retry or dlq.");
-        return null;
+        String targetTopic = connectorConfig.getDestTopic();
+        String targetTopicWithInstanceId;
+        if (StringUtils.isEmpty(targetTopic) || StringUtils.isBlank(targetTopic)) {
+            targetTopicWithInstanceId = ReplicatorUtils.buildTopicWithNamespace(topic, connectorConfig.getDestInstanceId());
+        } else {
+            targetTopicWithInstanceId = ReplicatorUtils.buildTopicWithNamespace(targetTopic, connectorConfig.getDestInstanceId());
+        }
+        return targetTopicWithInstanceId;
     }
 
     private ConnectRecord convertToSinkDataEntry(MessageExt message) {
@@ -542,7 +562,7 @@ public class ReplicatorSourceTask extends SourceTask {
             for (Map.Entry<String, String> entry : properties.entrySet()) {
                 if (MQ_SYS_KEYS.contains(entry.getKey())) {
                     keyValue.put("MQ-SYS-" + entry.getKey(), entry.getValue());
-                } else if (entry.getKey().startsWith("connect-ext-")){
+                } else if (entry.getKey().startsWith("connect-ext-")) {
                     keyValue.put(entry.getKey().replaceAll("connect-ext-", ""), entry.getValue());
                 } else {
                     keyValue.put(entry.getKey(), entry.getValue());
@@ -591,7 +611,6 @@ public class ReplicatorSourceTask extends SourceTask {
     }
 
     private AtomicLong flushInterval = new AtomicLong();
-
 
     public long removeMessage(MessageQueue mq, long removeOffset) {
         TreeMap<Long, UnAckMessage> offsets = queue2Offsets.get(mq);
@@ -651,18 +670,6 @@ public class ReplicatorSourceTask extends SourceTask {
     }
 
     @Override
-    public void commit() {
-
-    }
-
-    @Override
-    public void commit(List<ConnectRecord> records, Map<String, String> metadata) {
-        for (ConnectRecord record : records) {
-            this.commit(record, metadata);
-        }
-    }
-
-    @Override
     public void commit(ConnectRecord record, Map<String, String> metadata) {
         if (metadata == null) {
             // send failed
@@ -701,7 +708,7 @@ public class ReplicatorSourceTask extends SourceTask {
     @Override
     public void start(KeyValue config) {
         log.info("ReplicatorSourceTask init " + config);
-        log.info(" sourceTaskContextConfigs : " + sourceTaskContext.configs());
+        log.info("sourceTaskContextConfigs : " + sourceTaskContext.configs());
         // build connectConfig
         connectorConfig.setTaskId(sourceTaskContext.getTaskName().substring(sourceTaskContext.getConnectorName().length()) + 1);
         connectorConfig.setConnectorId(sourceTaskContext.getConnectorName());
@@ -726,6 +733,8 @@ public class ReplicatorSourceTask extends SourceTask {
         connectorConfig.setSrcAccessKey(config.getString(ReplicatorConnectorConfig.SRC_ACCESS_KEY));
         connectorConfig.setSrcSecretKey(config.getString(ReplicatorConnectorConfig.SRC_SECRET_KEY));
 
+        connectorConfig.setCommitOffsetIntervalMs(config.getLong(ReplicatorConnectorConfig.COMMIT_OFFSET_INTERVALS_MS, 10 * 1000));
+
         connectorConfig.setConsumeFromWhere(config.getString(ReplicatorConnectorConfig.CONSUME_FROM_WHERE, ConsumeFromWhere.CONSUME_FROM_LAST_OFFSET.name()));
         if (connectorConfig.getConsumeFromWhere() == ConsumeFromWhere.CONSUME_FROM_TIMESTAMP) {
             connectorConfig.setConsumeFromTimestamp(Long.parseLong(config.getString(ReplicatorConnectorConfig.CONSUME_FROM_TIMESTAMP)));
@@ -743,7 +752,7 @@ public class ReplicatorSourceTask extends SourceTask {
             }
             log.info("createAndUpdatePullConsumerGroup " + pullConsumerGroup + " finished.");
             ReplicatorTaskStats.init();
-            log.info("TaskStats inited.");
+            log.info("TaskStats init.");
             // init converter
             // init pullConsumer
             buildConsumer();
@@ -753,7 +762,7 @@ public class ReplicatorSourceTask extends SourceTask {
             log.info("RateLimiter init finished.");
             // subscribe topic & start consumer
             subscribeTopicAndStartConsumer();
-            // init sync delay metrics moitor
+            // init sync delay metrics monitor
             execScheduleTask();
             log.info("RateLimiter init finished.");
             log.info("QueueOffsetManager init finished.");

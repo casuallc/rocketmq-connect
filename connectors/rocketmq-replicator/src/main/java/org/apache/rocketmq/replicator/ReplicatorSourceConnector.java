@@ -29,10 +29,10 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedList;
-import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.UUID;
+import java.util.List;
+import java.util.Set;
 import org.apache.commons.collections4.CollectionUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.logging.Log;
@@ -53,12 +53,15 @@ import org.apache.rocketmq.replicator.exception.InitMQClientException;
 import org.apache.rocketmq.replicator.utils.ReplicatorUtils;
 import org.apache.rocketmq.tools.admin.DefaultMQAdminExt;
 
+import static org.apache.rocketmq.connect.runtime.config.ConnectorConfig.CONNECTOR_ID;
+import static org.apache.rocketmq.connect.runtime.config.ConnectorConfig.ERRORS_TOLERANCE_CONFIG;
+import static org.apache.rocketmq.connect.runtime.config.SourceConnectorConfig.CONNECT_TOPICNAME;
+
 /**
  * @author osgoo
- * @date 2022/6/16
  */
 public class ReplicatorSourceConnector extends SourceConnector {
-    private Log log = LogFactory.getLog(ReplicatorSourceConnector.class);
+    private final Log log = LogFactory.getLog(ReplicatorSourceConnector.class);
     private KeyValue connectorConfig;
     private DefaultMQAdminExt srcMQAdminExt;
 
@@ -115,12 +118,12 @@ public class ReplicatorSourceConnector extends SourceConnector {
             }
         });
         List<List<MessageQueue>> result = new ArrayList<>(maxTasks);
-        for (int i = 0;i < maxTasks;i++) {
+        for (int i = 0; i < maxTasks; i++) {
             List<MessageQueue> subTasks = new ArrayList<>();
             result.add(subTasks);
             log.info("add subTask");
         }
-        for (int i = 0;i < taskTopicInfos.size();i++) {
+        for (int i = 0; i < taskTopicInfos.size(); i++) {
             int hash = i % maxTasks;
             MessageQueue messageQueue = taskTopicInfos.get(i);
             result.get(hash).add(messageQueue);
@@ -157,9 +160,8 @@ public class ReplicatorSourceConnector extends SourceConnector {
         List<List<MessageQueue>> normalDivided = divide(messageQueues, maxTasks);
         log.info("normalDivided : " + normalDivided + " " + normalDivided);
 
-
         List<KeyValue> configs = new ArrayList<>();
-        for (int i = 0;i < maxTasks;i++) {
+        for (int i = 0; i < maxTasks; i++) {
             KeyValue keyValue = new DefaultKeyValue();
             keyValue.put(ReplicatorConnectorConfig.DIVIDED_NORMAL_QUEUES, JSON.toJSONString(normalDivided.get(i)));
 
@@ -191,6 +193,7 @@ public class ReplicatorSourceConnector extends SourceConnector {
             keyValue.put(ConnectorConfig.USE_NAMESRV_OF_CONNECTOR, "true");
 
             keyValue.put(ReplicatorConnectorConfig.SYNC_TPS, connectorConfig.getInt(ReplicatorConnectorConfig.SYNC_TPS, ReplicatorConnectorConfig.DEFAULT_SYNC_TPS));
+            keyValue.put(ReplicatorConnectorConfig.COMMIT_OFFSET_INTERVALS_MS, connectorConfig.getLong(ReplicatorConnectorConfig.COMMIT_OFFSET_INTERVALS_MS, 10 * 1000L));
 
             configs.add(keyValue);
             log.info("ReplicatorSourceConnector sub task config : " + keyValue);
@@ -228,16 +231,16 @@ public class ReplicatorSourceConnector extends SourceConnector {
             add(ReplicatorConnectorConfig.DEST_CLUSTER);
             add(ReplicatorConnectorConfig.DEST_ENDPOINT);
             add(ReplicatorConnectorConfig.DEST_TOPIC);
+            add(ReplicatorConnectorConfig.SRC_CLOUD);
             add(ReplicatorConnectorConfig.SRC_ACL_ENABLE);
             add(ReplicatorConnectorConfig.DEST_ACL_ENABLE);
             add(ERRORS_TOLERANCE_CONFIG);
         }
     };
 
-
     @Override
     public void validate(KeyValue config) {
-        log.info("sourceconnectValidate : " + config);
+        log.info("source connector validate : " + config);
         if (StringUtils.isNotBlank(config.getString(CONNECT_TOPICNAME))) {
             log.warn("ReplicatorSourceConnector no need to set " + CONNECT_TOPICNAME + ", use " + ReplicatorConnectorConfig.DEST_TOPIC + " instead.");
             // use destInstanceId % destTopic for sink instead of CONNECT_TOPICNAME
